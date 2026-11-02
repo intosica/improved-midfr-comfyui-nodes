@@ -255,3 +255,39 @@ def blank_reference(img, area, fill="grey", expand=16):
     else:
         base = np.full_like(img, 0.5)
     return (img * (1.0 - mk) + base * mk).astype("float32")
+
+
+# ---------------------------------------------------------------- direct object edit
+SMALL_BOX_AREA = 0.06e6
+
+
+def auto_context_padding(x0, y0, x1, y1):
+    """Context kept around a box when it is cropped out and enlarged for editing ("edit the object directly").
+    A small box (headwear, mouth, eyes: under ~0.06 MP) gets a window 3x the box, because a crop of only the box loses
+    what the part belongs to (a headband on nothing made her bald). A bigger box (outfit, shoes) gets about a third of its
+    longest side on every side: enough to see the body and surroundings, small enough that the object fills the frame
+    instead of sitting tiny on a zoomed-out canvas."""
+    side = max(x1 - x0, y1 - y0)
+    if (x1 - x0) * (y1 - y0) < SMALL_BOX_AREA:
+        return max(32, side)
+    return max(32, int(round(side * 0.35)))
+
+
+def swap_reference_latents(conditioning, latent):
+    """Copy of a conditioning list with its reference latents replaced by `latent` (the crop actually being edited), so
+    the picture the model is told to copy is the same picture it is drawing on. Everything else (text embedding, the
+    reference method) is kept. Conditioning without reference latents is returned unchanged."""
+    out = []
+    for item in conditioning:
+        if isinstance(item, (list, tuple)) and len(item) > 1 and isinstance(item[1], dict) and item[1].get("reference_latents") is not None:
+            d = dict(item[1])
+            d["reference_latents"] = [latent]
+            out.append([item[0], d])
+        else:
+            out.append(item)
+    return out
+
+
+def has_reference_latents(conditioning):
+    return any(isinstance(c, (list, tuple)) and len(c) > 1 and isinstance(c[1], dict) and c[1].get("reference_latents") is not None
+               for c in (conditioning or []))

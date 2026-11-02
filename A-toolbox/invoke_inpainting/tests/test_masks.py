@@ -171,3 +171,22 @@ class BlankReferenceTests(unittest.TestCase):
         self.assertTrue(np.array_equal(masks.blank_reference(self.img, self.area, "keep", 8), self.img))
         self.assertTrue(np.array_equal(masks.blank_reference(self.img, np.zeros_like(self.area), "grey", 8), self.img))
         self.assertTrue(np.array_equal(masks.blank_reference(self.img, None, "grey", 8), self.img))
+
+
+class DirectEditHelpers(unittest.TestCase):
+    def test_auto_context_small_box_is_three_times(self):
+        self.assertEqual(masks.auto_context_padding(100, 100, 250, 250), 150)  # 150px box: window 450 = 3x
+
+    def test_auto_context_big_box_is_a_third(self):
+        self.assertEqual(masks.auto_context_padding(0, 0, 400, 700), 245)  # 0.35 * 700, not the whole picture
+
+    def test_swap_reference_latents(self):
+        cond = [["emb", {"reference_latents": ["full"], "reference_latents_method": "m", "pooled_output": 1}]]
+        out = masks.swap_reference_latents(cond, "crop")
+        self.assertEqual(out[0][1]["reference_latents"], ["crop"])
+        self.assertEqual(out[0][1]["reference_latents_method"], "m")
+        self.assertEqual(cond[0][1]["reference_latents"], ["full"])  # original untouched
+        self.assertTrue(masks.has_reference_latents(cond))
+        plain = [["emb", {}]]
+        self.assertFalse(masks.has_reference_latents(plain))
+        self.assertEqual(masks.swap_reference_latents(plain, "crop"), plain)

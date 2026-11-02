@@ -7,7 +7,8 @@ import torch.nn.functional as F
 
 import nodes as comfy_nodes  # ComfyUI's own nodes.py (common_ksampler)
 
-from .masks import COHERENCE_MODES, FILL_MODES, blank_reference, plan_inpaint, resize_mask, strength_to_denoise
+from .masks import (COHERENCE_MODES, FILL_MODES, auto_context_padding, blank_reference, has_reference_latents, mask_rect, plan_inpaint,
+                    resize_mask, strength_to_denoise, swap_reference_latents)
 
 SIGMA_EPS = 1e-4  # Invoke's epsilon in the mask-promotion test
 
@@ -181,10 +182,12 @@ class InvokeInpaintingMOSS:
                 "scale_before_processing": (["auto", "off"], {"default": "auto",
                                             "tooltip": "auto: upscale small boxes to ~1 MP, as Invoke does"}),
                 "crop_to_box": ("BOOLEAN", {"default": False, "tooltip":
-                    "On = Invoke's behaviour (generate only the box region). Leave OFF when the text encoder carries the "
-                    "image as a reference (MOSS edit), or the model redraws the whole picture inside the box"}),
+                    "On = edit the object directly: the box is cut out with context around it (context_padding), enlarged to ~1 MP, edited there and pasted back. "
+                    "Per-box mode (clip + passes) re-encodes the prompt for the crop (prompt_style decides instruction or layout). "
+                    "With stock edit encoders only the reference latent is swapped for the crop; their vision tokens and layout boxes still describe the whole picture, so use a plain instruction and enough context. "
+                    "Off = the whole picture is processed and the box only limits the paste"}),
                 "context_padding": ("INT", {"default": -1, "min": -1, "max": 2048, "step": 1, "tooltip":
-                    "-1 = auto. With crop_to_box, or when a small box is enlarged (box_working_mp): widen the crop by this many px around "
+                    "-1 = auto (small box: 3x the box; bigger box: a third of its longest side). With crop_to_box, or when a box is enlarged (box_working_mp): widen the crop by this many px around "
                     "the box so the model sees surrounding context. Only the box is repainted and pasted back"}),
             },
             "optional": {
@@ -200,7 +203,7 @@ class InvokeInpaintingMOSS:
                 "edit_format": (list(EDIT_FORMATS), {"default": "ai-toolkit", "tooltip": "Per-box mode: the layout your edit LoRA was trained with"}),
                 "hide_edit_area": (FILL_MODES, {"default": "keep", "tooltip": "Per-box mode: how the box is hidden in the reference picture"}),
                 "expand": ("INT", {"default": 16, "min": 0, "max": 256, "step": 8, "tooltip": "Per-box mode: grow the hidden area by this many px"}),
-                "negative_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Per-box mode: empty = zeroed conditioning"}),
+                "negative_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Per-box mode: negative prompt (empty is fine)"}),
                 "prompt": ("STRING", {"default": "", "multiline": True, "tooltip":
                     "Per-box mode: the description of the whole picture (connect the bbox node's 'prompt' output, or type it). "
                     "Used as the scene description for every box. With no boxes, this is the prompt for one whole-picture pass"}),
@@ -215,10 +218,8 @@ class InvokeInpaintingMOSS:
                 "tone_fix": ("BOOLEAN", {"default": False, "tooltip":
                     "Remove the colour shift the VAE round trip adds to the parts of the picture that were not repainted (blocky lighter patches next to the edit)"}),
                 "box_working_mp": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 16.0, "step": 0.1, "tooltip":
-                    "-1 = auto: a small box (under ~0.06 MP: headwear, mouth, eyes) is cropped out with its surroundings (a window 3x the box) and enlarged to ~1 MP; a bigger one "
-                    "(shoes, outfits) is edited inside the whole picture, which keeps pose and surroundings. "
-                    "Otherwise: a box (plus context_padding) smaller than this many megapixels is cropped out, enlarged to about this "
-                    "size, edited there, scaled back down and blended in. 0 = never"}),
+                    "Per-box mode with crop_to_box: a box (plus context_padding) smaller than this many megapixels is cropped out, enlarged to about this "
+                    "size, edited there, scaled back down and blended in; a bigger one is edited inside the whole picture. -1 = auto (1 MP). 0 = never"}),
                 "seam_match": ("BOOLEAN", {"default": True, "tooltip":
                     "Per-box mode: remove mild tone drift along the inside of the repaint edge (background, skin, a hand) so the edit leaves no visible patch outline"}),
                 "preserve_unchanged": ("BOOLEAN", {"default": False, "tooltip":
@@ -240,16 +241,28 @@ class InvokeInpaintingMOSS:
         if clip is not None and (passes or (prompt or "").strip()):
             return self.run_passes(model, clip, vae, image, passes, seed, steps, cfg, strength, edge_size, coherence_mode,
                                    minimum_denoise, mask_blur, scale_before_processing, inpaint_mask, edit_format,
-                                   hide_edit_area, expand, negative_prompt, box_working_mp, context_padding, prompt, prompt_style, tone_fix, edge_restore, skin_match, seam_match, preserve_unchanged, context, hide_mask)
+                                   hide_edit_area, expand, negative_prompt, box_working_mp, context_padding, prompt, prompt_style, tone_fix, edge_restore, skin_match, seam_match, preserve_unchanged, context, hide_mask, crop_to_box)
         if positive is None or negative is None:
             raise ValueError("Connect positive and negative, or clip + passes for per-box mode.")
+        rebuild = False
+        pad = max(0, context_padding)
+        if crop_to_box and has_reference_latents(positive):
+            # DIRECT OBJECT EDIT with stock edit encoders. Their reference is the whole picture; cropping the box next to it makes
+            # the model redraw that whole picture inside the box. So the crop is cut out with context around it, enlarged, and its
+            # own latent replaces the reference (inside run_one), so the model copies and edits the same picture it draws on.
+            rebuild = True
+            if context_padding < 0:
+                _, H, W, _ = image.shape
+                r = mask_rect(_mask_np(box_mask, H, W)) if box_mask is not None else None
+                pad = auto_context_padding(*r) if r else 0
         return self.run_one(model, positive, negative, vae, image, seed, steps, cfg, strength, edge_size,
                             coherence_mode, minimum_denoise, mask_blur, scale_before_processing, crop_to_box,
-                            max(0, context_padding), box_mask, inpaint_mask)
+                            pad, box_mask, inpaint_mask, rebuild_reference=rebuild)
+
 
     def run_passes(self, model, clip, vae, image, passes, seed, steps, cfg, strength, edge_size, coherence_mode,
                    minimum_denoise, mask_blur, scale, inpaint_mask, edit_format, hide_edit_area, expand, negative_prompt,
-                   box_working_mp=-1.0, context_padding=-1, scene="", prompt_style="instruction", tone_fix=False, edge_restore=0.0, skin_match=True, seam_match=True, preserve_unchanged=False, context="", hide_mask=None):
+                   box_working_mp=-1.0, context_padding=-1, scene="", prompt_style="instruction", tone_fix=False, edge_restore=0.0, skin_match=True, seam_match=True, preserve_unchanged=False, context="", hide_mask=None, crop_to_box=False):
         import json
 
         try:
@@ -271,22 +284,22 @@ class InvokeInpaintingMOSS:
             x0, y0, x1, y1 = (int(v) for v in p["rect"])
             st = p.get("strength")
             st = strength if st is None else float(st)
-            if "caption" in p:  # layout prompt for the full picture, with this node's scene text when given
-                p = dict(p, prompt=_layout_prompt(p["caption"], " ".join(t for t in (scene or p.get("summary", ""), p.get("context") or context) if t), x0, y0, x1, y1, W, H),
-                         summary=scene or p.get("summary", ""))
-                if prompt_style == "instruction":
-                    p["prompt"] = " ".join(t for t in (scene or p.get("summary", ""), p["caption"], p.get("context") or context) if t).strip()
-            # auto (-1), from the tests: a small box (headwear, mouth, eyes: under ~0.06 MP) is edited on its own enlarged crop, where
-            # the model sees only that part (in the whole picture it redraws the head around it); a bigger box (shoes, outfits) is
-            # edited inside the whole picture, which keeps pose and surroundings. Tiny boxes get more surrounding context.
-            # The user's own numbers win
-            box_area = (x1 - x0) * (y1 - y0)
-            eff_mp = box_working_mp
-            if box_working_mp < 0:
-                eff_mp = 1.0 if box_area < 0.06e6 else 0.0
-            # the window the model sees is the box plus as much context again on every side (3x the box), like cropping a ~1 MP
-            # window out of an upscaled picture: the face/hair/body around the box is in view, and the box is at a size the model draws well
-            eff_pad = max(32, max(x1 - x0, y1 - y0)) if context_padding < 0 else context_padding
+            # prompt_style picks the text for both the whole picture and a cut-out crop; layout coordinates are always relative
+            # to the picture the model draws on, and the scene/context text is the same in both styles
+            caption = p.get("caption")
+            layout = caption is not None and prompt_style == "layout"
+            summary = scene or p.get("summary", "")
+            ctx = p.get("context") or context
+            if caption is None:
+                text = p.get("prompt") or ""
+            elif layout:
+                text = _layout_prompt(caption, " ".join(t for t in (summary, ctx) if t), x0, y0, x1, y1, W, H)
+            else:
+                text = " ".join(t for t in (summary, caption, ctx) if t)
+            # crop_to_box: the box is cut out with context around it, enlarged to box_working_mp (-1 = ~1 MP) and edited
+            # there. Off: the box is edited inside the whole picture
+            eff_mp = (1.0 if box_working_mp < 0 else box_working_mp) if crop_to_box else 0.0
+            eff_pad = auto_context_padding(x0, y0, x1, y1) if context_padding < 0 else context_padding
             if eff_mp > 0:
                 px0, py0 = max(0, x0 - eff_pad), max(0, y0 - eff_pad)
                 px1, py1 = min(W, x1 + eff_pad), min(H, y1 + eff_pad)
@@ -309,8 +322,7 @@ class InvokeInpaintingMOSS:
                         if float(ic.max()) > 0.001:
                             inp_t = torch.from_numpy(np.ascontiguousarray(ic)).float()[None]
                     # the layout prompt's coordinates are relative to the picture the model sees: redo them for the crop
-                    sub_prompt = _layout_prompt(p.get("caption"), p.get("summary", ""), bx0, by0, bx1, by1, sw, sh) \
-                        if ("caption" in p and prompt_style == "layout") else (p.get("prompt") or "")
+                    sub_prompt = _layout_prompt(caption, " ".join(t for t in (summary, ctx) if t), bx0, by0, bx1, by1, sw, sh) if layout else text
                     hide_c = resize_mask(hide[py0:py1, px0:px1], sw, sh) if hide is not None else None
                     pos, neg = self._encode_pair(enc, clip, vae, edit_format, sub, hide_edit_area, expand, box_t, inp_t,
                                                  sub_prompt, negative_prompt, hide_c)
@@ -330,7 +342,7 @@ class InvokeInpaintingMOSS:
                 grown = _grow(inp, 8) if edge_restore > 0 else inp  # edge_restore trims about one cell off the edge
                 inp_t = torch.from_numpy(np.ascontiguousarray(grown * box)).float()[None]
             pos, neg = self._encode_pair(enc, clip, vae, edit_format, cur, hide_edit_area, expand, box_t, inp_t,
-                                         p.get("prompt") or "", negative_prompt, hide * box if hide is not None else None)
+                                         text, negative_prompt, hide * box if hide is not None else None)
             cur, pasted = self.run_one(model, pos, neg, vae, cur, seed, steps, cfg, st, edge_size, coherence_mode,
                                        minimum_denoise, mask_blur, scale, False, 0, box_t, inp_t, tone_fix, edge_restore, skin_match, seam_match, preserve_unchanged)
             union = torch.maximum(union, pasted.to(union.device))
@@ -343,21 +355,12 @@ class InvokeInpaintingMOSS:
             image = torch.from_numpy(np.ascontiguousarray(blank_reference(arr, hide, "blurred", int(expand)))).to(image.device, image.dtype)[None]
         args = dict(clip=clip, vae=vae, edit_format=edit_format, image=image, hide_edit_area=hide_edit_area,
                     expand=expand, box_mask=box_t, inpaint_mask=inp_t)
-        pos = enc.encode(prompt=prompt, **args)[0]
-        neg = enc.encode(prompt=negative_prompt or "", **args)[0]
-        if not (negative_prompt or "").strip():  # same as ConditioningZeroOut
-            zeroed = []
-            for t in neg:
-                d = t[1].copy()
-                if d.get("pooled_output") is not None:
-                    d["pooled_output"] = torch.zeros_like(d["pooled_output"])
-                zeroed.append([torch.zeros_like(t[0]), d])
-            neg = zeroed
-        return pos, neg
+        # an empty negative is encoded like the stock workflow does; a zeroed one turns the edit into blocky mush at cfg > 1
+        return enc.encode(prompt=prompt, **args)[0], enc.encode(prompt=negative_prompt or "", **args)[0]
 
     def run_one(self, model, positive, negative, vae, image, seed, steps, cfg, strength, edge_size,
                 coherence_mode, minimum_denoise, mask_blur, scale_before_processing, crop_to_box=False,
-                context_padding=0, box_mask=None, inpaint_mask=None, tone_fix=False, edge_restore=0.0, skin_match=True, seam_match=True, preserve_unchanged=False):
+                context_padding=0, box_mask=None, inpaint_mask=None, tone_fix=False, edge_restore=0.0, skin_match=True, seam_match=True, preserve_unchanged=False, rebuild_reference=False):
         image = image[:1]
         _, H, W, _ = image.shape
         plan = plan_inpaint(H, W, _mask_np(box_mask, H, W), _mask_np(inpaint_mask, H, W),
@@ -370,6 +373,9 @@ class InvokeInpaintingMOSS:
         crop = image[:, y0:y1, x0:x1, :3]
         proc = _resize(crop, ph, pw)
         latent = {"samples": vae.encode(proc[:, :, :, :3])}
+        if rebuild_reference:
+            positive = swap_reference_latents(positive, latent["samples"])
+            negative = swap_reference_latents(negative, latent["samples"])
 
         m = model.clone()
         if plan["weight"] is not None:
