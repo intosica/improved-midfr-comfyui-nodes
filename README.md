@@ -2,7 +2,8 @@
 
 Three small packs of custom [ComfyUI](https://github.com/comfyanonymous/ComfyUI) nodes: everyday workflow tools, dataset tagging, and MiniMax H3 prompt building.
 
-> **Is this safe?** Yes, and you don't have to take my word for it: it's 100% plain-text Python and JavaScript, no compiled files, no installers, no obfuscation. See [SECURITY.md](SECURITY.md) for exactly what each pack touches (files, network, processes) and how to check it yourself in 5 minutes.
+> **Is this safe?** Yes. No clue why previous author said this. Probably just 'vibe-coders first code' talk, which is fair. I'm a vibe-coder too, so I get it.
+Node was sent through Claude on MCP connection to test and fix. Unless bro is a genius or something... this should be safe to use.
 
 | Pack | Name | Nodes | 
 | ----- | ----- | ----- | 
