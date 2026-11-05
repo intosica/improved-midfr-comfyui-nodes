@@ -259,6 +259,7 @@ def blank_reference(img, area, fill="grey", expand=16):
 
 # ---------------------------------------------------------------- direct object edit
 SMALL_BOX_AREA = 0.06e6
+MIN_WINDOW_AREA = 0.6e6  # MOSS draws a soft, blurry object on a smaller canvas
 
 
 def auto_context_padding(x0, y0, x1, y1):
@@ -273,15 +274,71 @@ def auto_context_padding(x0, y0, x1, y1):
     return max(32, int(round(side * 0.35)))
 
 
-def swap_reference_latents(conditioning, latent):
-    """Copy of a conditioning list with its reference latents replaced by `latent` (the crop actually being edited), so
-    the picture the model is told to copy is the same picture it is drawing on. Everything else (text embedding, the
-    reference method) is kept. Conditioning without reference latents is returned unchanged."""
+def min_window_padding(x0, y0, x1, y1, pad, width, height):
+    """`pad` grown until the window (clamped to the picture) has at least MIN_WINDOW_AREA real pixels. Inpainted on a small
+    native crop the result is soft, and a small crop enlarged to ~1 MP makes the model invent things (cards, flowers, hands)
+    in the zoomed context; on a big native window it draws at the picture's own detail. Only for the window that is sampled:
+    the text encoder keeps the tight auto_context_padding crop (shown more of the picture it pulls other objects in)."""
+    def area(p):
+        return (min(width, x1 + p) - max(0, x0 - p)) * (min(height, y1 + p) - max(0, y0 - p))
+    while area(pad) < min(MIN_WINDOW_AREA, width * height):
+        pad += 16
+    return pad
+
+
+def drop_edit_reference(conditioning):
+    """Copy of a conditioning list without its FIRST reference latent (the picture being edited). On a crop the noise mask
+    already keeps everything around the edit; with that picture as a reference as well, the model copies its old content
+    back in pixel for pixel (a shrunk object comes back full size, a hidden area comes back grey). Further references (a
+    garment, a face...) are kept. Conditioning without reference latents is returned unchanged."""
     out = []
     for item in conditioning:
         if isinstance(item, (list, tuple)) and len(item) > 1 and isinstance(item[1], dict) and item[1].get("reference_latents") is not None:
             d = dict(item[1])
-            d["reference_latents"] = [latent]
+            d["reference_latents"] = list(d["reference_latents"])[1:]
+            d["invoke_ref_strengths"] = list(d.get("invoke_ref_strengths") or [])[1:]
+            if not d["reference_latents"]:
+                for k in ("reference_latents", "reference_latents_method", "invoke_ref_strengths"):
+                    d.pop(k, None)
+            out.append([item[0], d])
+        else:
+            out.append(item)
+    return out
+
+
+def scale_reference(conditioning, index, factor):
+    """Copy with reference number `index` multiplied by `factor` (1.0 = untouched); the strength is remembered in
+    `invoke_ref_strengths`."""
+    out = []
+    for item in conditioning:
+        if factor != 1.0 and isinstance(item, (list, tuple)) and len(item) > 1 and isinstance(item[1], dict) \
+                and item[1].get("reference_latents") is not None and len(item[1]["reference_latents"]) > index:
+            d = dict(item[1])
+            refs = list(d["reference_latents"])
+            strengths = list(d.get("invoke_ref_strengths") or [])
+            strengths += [1.0] * (len(refs) - len(strengths))
+            refs[index] = refs[index] * factor
+            strengths[index] = float(strengths[index]) * float(factor)
+            d["reference_latents"], d["invoke_ref_strengths"] = refs, strengths
+            d.pop("ref_kv", None)
+            out.append([item[0], d])
+        else:
+            out.append(item)
+    return out
+
+
+def append_reference(conditioning, latent, strength=1.0):
+    """Copy with one more reference latent (already scaled by `strength`) added after the existing ones. Only conditioning
+    that already carries references is touched (the first reference stays the picture being edited)."""
+    out = []
+    for item in conditioning:
+        if isinstance(item, (list, tuple)) and len(item) > 1 and isinstance(item[1], dict) and item[1].get("reference_latents") is not None:
+            d = dict(item[1])
+            refs = list(d["reference_latents"])
+            strengths = list(d.get("invoke_ref_strengths") or [])
+            strengths += [1.0] * (len(refs) - len(strengths))
+            d["reference_latents"], d["invoke_ref_strengths"] = refs + [latent], strengths + [float(strength)]
+            d.pop("ref_kv", None)
             out.append([item[0], d])
         else:
             out.append(item)

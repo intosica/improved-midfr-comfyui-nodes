@@ -1,14 +1,13 @@
 """Invoke Inpainting (MOSS): crop to a box, repaint inside it (optionally only inside a mask), paste back.
 Settings default to InvokeAI's canvas defaults. See README.md for what is copied and what is not."""
 import numpy as np
-import os
 import torch
 import torch.nn.functional as F
 
 import nodes as comfy_nodes  # ComfyUI's own nodes.py (common_ksampler)
 
-from .masks import (COHERENCE_MODES, FILL_MODES, auto_context_padding, blank_reference, has_reference_latents, mask_rect, plan_inpaint,
-                    resize_mask, strength_to_denoise, swap_reference_latents)
+from .masks import (COHERENCE_MODES, FILL_MODES, MIN_WINDOW_AREA, auto_context_padding, blank_reference, drop_edit_reference, mask_rect,
+                    min_window_padding, plan_inpaint, resize_mask, strength_to_denoise)
 
 SIGMA_EPS = 1e-4  # Invoke's epsilon in the mask-promotion test
 
@@ -125,6 +124,36 @@ def _seam_match(gen, crop, alpha):
     return (g + field * w).clamp(0, 1).permute(0, 2, 3, 1)
 
 
+def _window_wrapper(shift_y, shift_x, keep):
+    """The sampled window is a piece of the picture the first reference shows: put the window's rope positions where that
+    piece sits in the reference, and take the reference tokens under the edit area out of attention (shown, they are copied
+    back; hidden with grey, the grey is). keep: bool per token of the first reference."""
+    def wrapper(apply_model, args):
+        c = dict(args["c"])
+        to = dict(c.get("transformer_options", {}))
+        ro = dict(to.get("rope_options", {}))
+        ro["shift_y"], ro["shift_x"] = ro.get("shift_y", 0.0) + shift_y, ro.get("shift_x", 0.0) + shift_x
+        to["rope_options"] = ro
+        c["transformer_options"] = to
+        if c.get("ref_kv") is not None:
+            kv = c["ref_kv"]
+            keep_all = torch.cat((keep, keep.new_ones(kv.shape[3] - keep.numel()))).to(kv.device)  # later references stay whole
+            c["ref_kv"] = kv[:, :, :, keep_all.nonzero()[:, 0]]
+        return apply_model(args["input"], args["timestep"], **c)
+    return wrapper
+
+
+def zero_conditioning(cond):
+    """Same as ConditioningZeroOut (the references are kept)."""
+    out = []
+    for t in cond:
+        d = dict(t[1])
+        if d.get("pooled_output") is not None:
+            d["pooled_output"] = torch.zeros_like(d["pooled_output"])
+        out.append([torch.zeros_like(t[0]), d])
+    return out
+
+
 def _scene_text(text):
     """The bbox node's 'prompt' output is the layout JSON of ALL boxes once any box exists. Per pass only this box's own
     caption may be in the prompt (otherwise one box's edit leaks into another), so keep just the scene sentence."""
@@ -182,12 +211,14 @@ class InvokeInpaintingMOSS:
                 "scale_before_processing": (["auto", "off"], {"default": "auto",
                                             "tooltip": "auto: upscale small boxes to ~1 MP, as Invoke does"}),
                 "crop_to_box": ("BOOLEAN", {"default": False, "tooltip":
-                    "On = edit the object directly: the box is cut out with context around it (context_padding), enlarged to ~1 MP, edited there and pasted back. "
-                    "Per-box mode (clip + passes) re-encodes the prompt for the crop (prompt_style decides instruction or layout). "
-                    "With stock edit encoders only the reference latent is swapped for the crop; their vision tokens and layout boxes still describe the whole picture, so use a plain instruction and enough context. "
+                    "On = edit the object directly: the box is cut out with context around it (context_padding grown to at least 0.6 MP of the picture), inpainted there and pasted back. "
+                    "The picture being edited is dropped from the references (the crop's surroundings are kept by the noise mask; as a reference the model copies the old content back). "
+                    "For the encoders use Text Encode MOSS-Image Edit (masked reference) with crop_to_box on and hide_edit_area grey (it shows the text encoder the same crop with the object hidden, "
+                    "which keeps the clothing/skin around it), or stock encoders with image_strength 0 (their vision tokens show the whole picture and pull its other objects into the crop). "
                     "Off = the whole picture is processed and the box only limits the paste"}),
                 "context_padding": ("INT", {"default": -1, "min": -1, "max": 2048, "step": 1, "tooltip":
-                    "-1 = auto (small box: 3x the box; bigger box: a third of its longest side). With crop_to_box, or when a box is enlarged (box_working_mp): widen the crop by this many px around "
+                    "-1 = auto (small box: 3x the box; bigger box: a third of its longest side; with crop_to_box then grown to at least 0.6 MP of the picture, so "
+                    "with scale_before_processing off the edit is drawn at the picture's own detail). With crop_to_box, or when a box is enlarged (box_working_mp): widen the crop by this many px around "
                     "the box so the model sees surrounding context. Only the box is repainted and pasted back"}),
             },
             "optional": {
@@ -201,9 +232,12 @@ class InvokeInpaintingMOSS:
                 "clip": ("CLIP", {"tooltip": "With passes: encodes each box's prompt itself (per-box mode)"}),
                 "passes": ("STRING", {"forceInput": True, "tooltip": "The 'passes' output of Image BBox Layout"}),
                 "edit_format": (list(EDIT_FORMATS), {"default": "ai-toolkit", "tooltip": "Per-box mode: the layout your edit LoRA was trained with"}),
-                "hide_edit_area": (FILL_MODES, {"default": "keep", "tooltip": "Per-box mode: how the box is hidden in the reference picture"}),
-                "expand": ("INT", {"default": 16, "min": 0, "max": 256, "step": 8, "tooltip": "Per-box mode: grow the hidden area by this many px"}),
-                "negative_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Per-box mode: negative prompt (empty is fine)"}),
+                "hide_edit_area": (FILL_MODES, {"default": "keep", "tooltip":
+                    "What the reference picture shows where the edit repaints: grey/blurred hide it there, keep shows it unchanged. Hiding it is what lets a "
+                    "replacement actually replace - with the old content still in the reference the model copies it, and below strength 1 nothing changes"}),
+                "expand": ("INT", {"default": 16, "min": 0, "max": 256, "step": 8, "tooltip":
+                    "Grow the hidden area by this many px (and feather its edge) so the edit has room to land"}),
+                "negative_prompt": ("STRING", {"default": "", "multiline": True, "tooltip": "Per-box mode: empty = zeroed conditioning"}),
                 "prompt": ("STRING", {"default": "", "multiline": True, "tooltip":
                     "Per-box mode: the description of the whole picture (connect the bbox node's 'prompt' output, or type it). "
                     "Used as the scene description for every box. With no boxes, this is the prompt for one whole-picture pass"}),
@@ -218,8 +252,9 @@ class InvokeInpaintingMOSS:
                 "tone_fix": ("BOOLEAN", {"default": False, "tooltip":
                     "Remove the colour shift the VAE round trip adds to the parts of the picture that were not repainted (blocky lighter patches next to the edit)"}),
                 "box_working_mp": ("FLOAT", {"default": -1.0, "min": -1.0, "max": 16.0, "step": 0.1, "tooltip":
-                    "Per-box mode with crop_to_box: a box (plus context_padding) smaller than this many megapixels is cropped out, enlarged to about this "
-                    "size, edited there, scaled back down and blended in; a bigger one is edited inside the whole picture. -1 = auto (1 MP). 0 = never"}),
+                    "-1 = auto: the box is cut out with context_padding around it (the window is grown until it holds 0.6 MP of the picture, so it is drawn at the picture's own detail) "
+                    "and only the box is pasted back. 0 = the box is edited inside the whole picture, which keeps pose and surroundings. "
+                    "Otherwise: a window smaller than this many megapixels is enlarged to about this size before it is edited (for very small pictures)"}),
                 "seam_match": ("BOOLEAN", {"default": True, "tooltip":
                     "Per-box mode: remove mild tone drift along the inside of the repaint edge (background, skin, a hand) so the edit leaves no visible patch outline"}),
                 "preserve_unchanged": ("BOOLEAN", {"default": False, "tooltip":
@@ -241,28 +276,41 @@ class InvokeInpaintingMOSS:
         if clip is not None and (passes or (prompt or "").strip()):
             return self.run_passes(model, clip, vae, image, passes, seed, steps, cfg, strength, edge_size, coherence_mode,
                                    minimum_denoise, mask_blur, scale_before_processing, inpaint_mask, edit_format,
-                                   hide_edit_area, expand, negative_prompt, box_working_mp, context_padding, prompt, prompt_style, tone_fix, edge_restore, skin_match, seam_match, preserve_unchanged, context, hide_mask, crop_to_box)
+                                   hide_edit_area, expand, negative_prompt, box_working_mp, context_padding, prompt, prompt_style, tone_fix, edge_restore, skin_match, seam_match, preserve_unchanged, context, hide_mask)
         if positive is None or negative is None:
             raise ValueError("Connect positive and negative, or clip + passes for per-box mode.")
-        rebuild = False
         pad = max(0, context_padding)
-        if crop_to_box and has_reference_latents(positive):
-            # DIRECT OBJECT EDIT with stock edit encoders. Their reference is the whole picture; cropping the box next to it makes
-            # the model redraw that whole picture inside the box. So the crop is cut out with context around it, enlarged, and its
-            # own latent replaces the reference (inside run_one), so the model copies and edits the same picture it draws on.
-            rebuild = True
-            if context_padding < 0:
-                _, H, W, _ = image.shape
-                r = mask_rect(_mask_np(box_mask, H, W)) if box_mask is not None else None
-                pad = auto_context_padding(*r) if r else 0
+        window_ref = None
+        if crop_to_box:
+            _, H, W, _ = image.shape
+            box = _mask_np(box_mask, H, W) if box_mask is not None else None
+            r = mask_rect(box) if box is not None else None
+            refs = next((t[1]["reference_latents"] for t in positive if t[1].get("reference_latents")), None)
+            method = next((t[1].get("reference_latents_method") for t in positive if t[1].get("reference_latents")), None)
+            if refs is not None and r and method != "index_timestep_zero":
+                # the window is sampled as a piece of the picture the reference shows (see _window_wrapper): the model sees the
+                # whole picture around it, only not what is under the edit area. Only the box is repainted, but the window is
+                # still grown to MIN_WINDOW_AREA: on a small window the model fills the hole with the picture's salient objects.
+                area = box > 0.5
+                inp = _mask_np(inpaint_mask, H, W)
+                if inp is not None and float((inp * area).max()) > 0.001:
+                    area = (inp > 0.001) & area
+                window_ref = (refs[0].shape[-2:], area)
+                pad = min_window_padding(*r, pad if context_padding >= 0 else auto_context_padding(*r), W, H)
+            else:
+                # The whole picture as a reference makes the model draw that picture into the box, the crop as a reference makes it
+                # copy the old object (or the grey/blur hiding it) back in, so the picture being edited is not a reference here.
+                positive, negative = drop_edit_reference(positive), drop_edit_reference(negative)
+                if context_padding < 0:
+                    pad = min_window_padding(*r, auto_context_padding(*r), W, H) if r else 0
         return self.run_one(model, positive, negative, vae, image, seed, steps, cfg, strength, edge_size,
                             coherence_mode, minimum_denoise, mask_blur, scale_before_processing, crop_to_box,
-                            pad, box_mask, inpaint_mask, rebuild_reference=rebuild)
+                            pad, box_mask, inpaint_mask, window_ref=window_ref)
 
 
     def run_passes(self, model, clip, vae, image, passes, seed, steps, cfg, strength, edge_size, coherence_mode,
                    minimum_denoise, mask_blur, scale, inpaint_mask, edit_format, hide_edit_area, expand, negative_prompt,
-                   box_working_mp=-1.0, context_padding=-1, scene="", prompt_style="instruction", tone_fix=False, edge_restore=0.0, skin_match=True, seam_match=True, preserve_unchanged=False, context="", hide_mask=None, crop_to_box=False):
+                   box_working_mp=-1.0, context_padding=-1, scene="", prompt_style="instruction", tone_fix=False, edge_restore=0.0, skin_match=True, seam_match=True, preserve_unchanged=False, context="", hide_mask=None):
         import json
 
         try:
@@ -284,23 +332,47 @@ class InvokeInpaintingMOSS:
             x0, y0, x1, y1 = (int(v) for v in p["rect"])
             st = p.get("strength")
             st = strength if st is None else float(st)
-            # prompt_style picks the text for both the whole picture and a cut-out crop; layout coordinates are always relative
-            # to the picture the model draws on, and the scene/context text is the same in both styles
-            caption = p.get("caption")
-            layout = caption is not None and prompt_style == "layout"
-            summary = scene or p.get("summary", "")
-            ctx = p.get("context") or context
-            if caption is None:
-                text = p.get("prompt") or ""
-            elif layout:
-                text = _layout_prompt(caption, " ".join(t for t in (summary, ctx) if t), x0, y0, x1, y1, W, H)
-            else:
-                text = " ".join(t for t in (summary, caption, ctx) if t)
-            # crop_to_box: the box is cut out with context around it, enlarged to box_working_mp (-1 = ~1 MP) and edited
-            # there. Off: the box is edited inside the whole picture
-            eff_mp = (1.0 if box_working_mp < 0 else box_working_mp) if crop_to_box else 0.0
+            if "caption" in p:  # layout prompt for the full picture, with this node's scene text when given
+                p = dict(p, prompt=_layout_prompt(p["caption"], " ".join(t for t in (scene or p.get("summary", ""), p.get("context") or context) if t), x0, y0, x1, y1, W, H),
+                         summary=scene or p.get("summary", ""))
+                if prompt_style == "instruction":
+                    p["prompt"] = " ".join(t for t in (scene or p.get("summary", ""), p["caption"], p.get("context") or context) if t).strip()
+            # box_working_mp 0 = the box is edited inside the whole picture (keeps pose and surroundings). Auto (-1) or > 0 =
+            # the box is cut out with its context and drawn at the picture's own detail, like crop_to_box does; only a box
+            # whose window is too small to fill MIN_WINDOW_AREA (a tiny picture) is enlarged first.
+            eff_mp = 1.0 if box_working_mp < 0 else box_working_mp
+            # the text encoder sees the box plus auto_context_padding only: showing it more of the picture pulls the picture's
+            # other objects into the box. The sampled window is a different, bigger one (see min_window_padding).
             eff_pad = auto_context_padding(x0, y0, x1, y1) if context_padding < 0 else context_padding
+            box = np.zeros((H, W), dtype=np.float32)
+            box[y0:y1, x0:x1] = 1.0
+            box_t = torch.from_numpy(box)[None]
+            pinp = inp * box if inp is not None and float((inp * box).max()) > 0.001 else None  # only paint inside this box
+            pinp_t = torch.from_numpy(np.ascontiguousarray(pinp)).float()[None] if pinp is not None else None
             if eff_mp > 0:
+                win = min_window_padding(x0, y0, x1, y1, eff_pad, W, H)
+                wx0, wy0 = max(0, x0 - win), max(0, y0 - win)
+                wx1, wy1 = min(W, x1 + win), min(H, y1 + win)
+                if (wx1 - wx0) * (wy1 - wy0) >= min(MIN_WINDOW_AREA, W * H):
+                    # the positive/negative path's recipe: the encoder sees the tight crop with the box hidden, the sampler
+                    # gets the big native window, and only the box is pasted back
+                    tx0, ty0 = max(0, x0 - eff_pad), max(0, y0 - eff_pad)
+                    tx1, ty1 = min(W, x1 + eff_pad), min(H, y1 + eff_pad)
+                    tw, th = tx1 - tx0, ty1 - ty0
+                    tb = np.zeros((th, tw), dtype=np.float32)
+                    tb[y0 - ty0:y1 - ty0, x0 - tx0:x1 - tx0] = 1.0
+                    tinp_t = torch.from_numpy(np.ascontiguousarray(pinp[ty0:ty1, tx0:tx1] * tb)).float()[None] if pinp is not None else None
+                    # the layout prompt's coordinates are relative to the picture the model sees: redo them for the window
+                    sub_prompt = _layout_prompt(p.get("caption"), p.get("summary", ""), x0 - wx0, y0 - wy0, x1 - wx0, y1 - wy0, wx1 - wx0, wy1 - wy0) \
+                        if ("caption" in p and prompt_style == "layout") else (p.get("prompt") or "")
+                    pos, neg = self._encode_pair(enc, clip, vae, edit_format, cur[:, ty0:ty1, tx0:tx1], hide_edit_area, expand,
+                                                 torch.from_numpy(tb)[None], tinp_t, sub_prompt, negative_prompt,
+                                                 hide[ty0:ty1, tx0:tx1] if hide is not None else None, reference=False)
+                    cur, pasted = self.run_one(model, pos, neg, vae, cur, seed, steps, cfg, st, edge_size, coherence_mode,
+                                               minimum_denoise, mask_blur, "off", True, win, box_t, pinp_t,
+                                               tone_fix, edge_restore, skin_match, seam_match, preserve_unchanged)
+                    union = torch.maximum(union, pasted.to(union.device))
+                    continue
                 px0, py0 = max(0, x0 - eff_pad), max(0, y0 - eff_pad)
                 px1, py1 = min(W, x1 + eff_pad), min(H, y1 + eff_pad)
                 cw, ch = px1 - px0, py1 - py0
@@ -314,57 +386,57 @@ class InvokeInpaintingMOSS:
                     by0, by1 = int((y0 - py0) * fy), min(sh, int(np.ceil((y1 - py0) * fy)))
                     box = np.zeros((sh, sw), dtype=np.float32)
                     box[by0:by1, bx0:bx1] = 1.0
-                    box_t = torch.from_numpy(box)[None]
-                    inp_t = None
+                    sbox_t = torch.from_numpy(box)[None]
+                    sinp_t = None
                     if inp is not None:
                         ic = resize_mask(inp[py0:py1, px0:px1], sw, sh)
                         ic = (_grow(ic, 8) if edge_restore > 0 else ic) * box
                         if float(ic.max()) > 0.001:
-                            inp_t = torch.from_numpy(np.ascontiguousarray(ic)).float()[None]
+                            sinp_t = torch.from_numpy(np.ascontiguousarray(ic)).float()[None]
                     # the layout prompt's coordinates are relative to the picture the model sees: redo them for the crop
-                    sub_prompt = _layout_prompt(caption, " ".join(t for t in (summary, ctx) if t), bx0, by0, bx1, by1, sw, sh) if layout else text
+                    sub_prompt = _layout_prompt(p.get("caption"), p.get("summary", ""), bx0, by0, bx1, by1, sw, sh) \
+                        if ("caption" in p and prompt_style == "layout") else (p.get("prompt") or "")
                     hide_c = resize_mask(hide[py0:py1, px0:px1], sw, sh) if hide is not None else None
-                    pos, neg = self._encode_pair(enc, clip, vae, edit_format, sub, hide_edit_area, expand, box_t, inp_t,
-                                                 sub_prompt, negative_prompt, hide_c)
+                    # no reference latent of the crop (see crop_to_box in run), only what the text encoder sees
+                    pos, neg = self._encode_pair(enc, clip, vae, edit_format, sub, hide_edit_area, expand, sbox_t, sinp_t,
+                                                 sub_prompt, negative_prompt, hide_c, reference=False)
                     res, pasted = self.run_one(model, pos, neg, vae, sub, seed, steps, cfg, st, edge_size, coherence_mode,
-                                               minimum_denoise, mask_blur, "off", False, 0, box_t, inp_t, tone_fix, edge_restore, skin_match, seam_match, preserve_unchanged)
+                                               minimum_denoise, mask_blur, "off", False, 0, sbox_t, sinp_t, tone_fix, edge_restore, skin_match, seam_match, preserve_unchanged)
                     gen = _resize(res.to(cur.device).float(), ch, cw)
                     a = _resize(pasted.to(cur.device).float()[..., None], ch, cw)
                     cur = cur.clone()
                     cur[:, py0:py1, px0:px1, :] = gen * a + crop * (1.0 - a)
                     union[:, py0:py1, px0:px1] = torch.maximum(union[:, py0:py1, px0:px1], a[..., 0])
                     continue
-            box = np.zeros((H, W), dtype=np.float32)
-            box[y0:y1, x0:x1] = 1.0
-            box_t = torch.from_numpy(box)[None]
-            inp_t = None
-            if inp is not None and float((inp * box).max()) > 0.001:  # only paint inside this box
-                grown = _grow(inp, 8) if edge_restore > 0 else inp  # edge_restore trims about one cell off the edge
-                inp_t = torch.from_numpy(np.ascontiguousarray(grown * box)).float()[None]
-            pos, neg = self._encode_pair(enc, clip, vae, edit_format, cur, hide_edit_area, expand, box_t, inp_t,
-                                         text, negative_prompt, hide * box if hide is not None else None)
+            pos, neg = self._encode_pair(enc, clip, vae, edit_format, cur, hide_edit_area, expand, box_t, pinp_t,
+                                         p.get("prompt") or "", negative_prompt, hide * box if hide is not None else None)
             cur, pasted = self.run_one(model, pos, neg, vae, cur, seed, steps, cfg, st, edge_size, coherence_mode,
-                                       minimum_denoise, mask_blur, scale, False, 0, box_t, inp_t, tone_fix, edge_restore, skin_match, seam_match, preserve_unchanged)
+                                       minimum_denoise, mask_blur, scale, False, 0, box_t, pinp_t, tone_fix, edge_restore, skin_match, seam_match, preserve_unchanged)
             union = torch.maximum(union, pasted.to(union.device))
         return (cur, union)
 
     @staticmethod
-    def _encode_pair(enc, clip, vae, edit_format, image, hide_edit_area, expand, box_t, inp_t, prompt, negative_prompt, hide=None):
+    def _encode_pair(enc, clip, vae, edit_format, image, hide_edit_area, expand, box_t, inp_t, prompt, negative_prompt, hide=None, reference=True):
         if hide is not None and float(np.max(hide)) > 0.001:  # items the edit removes: blurred out of the reference only
             arr = image[0].detach().float().cpu().numpy()
             image = torch.from_numpy(np.ascontiguousarray(blank_reference(arr, hide, "blurred", int(expand)))).to(image.device, image.dtype)[None]
-        args = dict(clip=clip, vae=vae, edit_format=edit_format, image=image, hide_edit_area=hide_edit_area,
+        # reference=False (a crop): no reference latent, the text encoder still sees the crop with the edit area hidden, which
+        # keeps what surrounds the object (clothing, skin) without showing the object itself
+        args = dict(clip=clip, vae=vae if reference else None, edit_format=edit_format, image=image, hide_edit_area=hide_edit_area,
                     expand=expand, box_mask=box_t, inpaint_mask=inp_t)
-        # an empty negative is encoded like the stock workflow does; a zeroed one turns the edit into blocky mush at cfg > 1
-        return enc.encode(prompt=prompt, **args)[0], enc.encode(prompt=negative_prompt or "", **args)[0]
+        pos = enc.encode(prompt=prompt, **args)[0]
+        neg = enc.encode(prompt=negative_prompt or "", **args)[0]
+        if not (negative_prompt or "").strip():
+            neg = zero_conditioning(neg)
+        return pos, neg
 
     def run_one(self, model, positive, negative, vae, image, seed, steps, cfg, strength, edge_size,
                 coherence_mode, minimum_denoise, mask_blur, scale_before_processing, crop_to_box=False,
-                context_padding=0, box_mask=None, inpaint_mask=None, tone_fix=False, edge_restore=0.0, skin_match=True, seam_match=True, preserve_unchanged=False, rebuild_reference=False):
+                context_padding=0, box_mask=None, inpaint_mask=None, tone_fix=False, edge_restore=0.0, skin_match=True, seam_match=True, preserve_unchanged=False, window_ref=None):
         image = image[:1]
         _, H, W, _ = image.shape
         plan = plan_inpaint(H, W, _mask_np(box_mask, H, W), _mask_np(inpaint_mask, H, W),
-                            scale_before_processing, edge_size, coherence_mode, minimum_denoise, mask_blur, crop_to_box,
+                            "off" if window_ref is not None else scale_before_processing, edge_size, coherence_mode, minimum_denoise, mask_blur, crop_to_box,
                             context_padding)
         x0, y0, x1, y1 = plan["rect"]
         cw, ch = plan["crop_size"]
@@ -373,15 +445,20 @@ class InvokeInpaintingMOSS:
         crop = image[:, y0:y1, x0:x1, :3]
         proc = _resize(crop, ph, pw)
         latent = {"samples": vae.encode(proc[:, :, :, :3])}
-        if rebuild_reference:
-            positive = swap_reference_latents(positive, latent["samples"])
-            negative = swap_reference_latents(negative, latent["samples"])
+        clean = latent["samples"]
 
         m = model.clone()
         if plan["weight"] is not None:
             weight = torch.from_numpy(np.ascontiguousarray(plan["weight"])).float()
             latent["noise_mask"] = weight.reshape(1, 1, ph, pw)
             m.set_model_denoise_mask_function(_invoke_mask_rule)
+        if window_ref is not None:
+            (rh, rw), area = window_ref
+            th, tw = latent["samples"].shape[-2:]
+            sy, sx = H / rh, W / rw  # picture px per reference token
+            cells = F.adaptive_max_pool2d(torch.from_numpy(np.ascontiguousarray(area)).float()[None, None], (rh, rw))[0, 0]
+            m.set_model_unet_function_wrapper(_window_wrapper(y0 / sy + (th - 1) / 2 - (rh - 1) / 2, x0 / sx + (tw - 1) / 2 - (rw - 1) / 2,
+                                                              cells.flatten() < 0.5))
 
         shift = getattr(m.get_model_object("model_sampling"), "shift", 1.0)
         denoise = strength_to_denoise(strength, float(shift))
@@ -395,7 +472,7 @@ class InvokeInpaintingMOSS:
         if tone_fix:
             # cells the sampler left alone come back through the VAE (encode + decode), which shifts colour a little and
             # shows up as lighter blocks next to the edit. Measure that shift on the untouched picture and take it out.
-            rt = vae.decode(latent["samples"])
+            rt = vae.decode(clean)
             if rt.dim() == 5:
                 rt = rt.reshape(-1, *rt.shape[-3:])
             rt = _resize(rt[:1, :, :, :3].to(image.device).float(), gen.shape[1], gen.shape[2])
@@ -492,10 +569,14 @@ class TextEncodeMOSSInpaint:
             "optional": {
                 "box_mask": ("MASK", {"tooltip": "Same as Invoke Inpainting's box_mask. Empty = whole image"}),
                 "inpaint_mask": ("MASK", {"tooltip": "Same as Invoke Inpainting's inpaint_mask. Empty = the whole box"}),
+                "crop_to_box": ("BOOLEAN", {"default": False, "tooltip":
+                    "For Invoke Inpainting with crop_to_box on (context_padding auto): the text encoder sees the box with its auto context (a tighter crop than the "
+                    "one sampled, so other objects in the picture are not pulled in), edit area hidden, "
+                    "and no reference latent is attached (the inpaint node drops it on a crop anyway)"}),
             },
         }
 
-    def encode(self, clip, prompt, vae, edit_format, image, hide_edit_area="grey", expand=16, box_mask=None, inpaint_mask=None):
+    def encode(self, clip, prompt, vae, edit_format, image, hide_edit_area="grey", expand=16, box_mask=None, inpaint_mask=None, crop_to_box=False):
         import math
 
         import comfy.utils
@@ -513,6 +594,12 @@ class TextEncodeMOSSInpaint:
         if area is not None and hide_edit_area != "keep":
             arr = img[0].detach().float().cpu().numpy()
             img = torch.from_numpy(np.ascontiguousarray(blank_reference(arr, area, hide_edit_area, int(expand)))).to(image.device, image.dtype)[None]
+        r = mask_rect(box) if (crop_to_box and box is not None) else None
+        if r:  # the crop Invoke Inpainting works on with context_padding auto
+            pad = auto_context_padding(*r)
+            img = img[:, max(0, r[1] - pad):min(H, r[3] + pad), max(0, r[0] - pad):min(W, r[2] + pad)]
+            _, H, W, _ = img.shape
+            vae = None
 
         vl = []
         if vision:
@@ -520,8 +607,9 @@ class TextEncodeMOSSInpaint:
             vl.append(comfy.utils.common_upscale(img.movedim(-1, 1), round(W * scale), round(H * scale), "area", "disabled").movedim(1, -1))
             prompt = "".join("Picture {}: <|vision_start|><|image_pad|><|vision_end|>".format(i + 1) for i in range(len(vl))) + prompt
         conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(prompt, images=vl))
-        refs = [vae.encode(img)]
-        return (node_helpers.conditioning_set_values(conditioning, {"reference_latents": refs, "reference_latents_method": method}),)
+        if vae is None:
+            return (conditioning,)
+        return (node_helpers.conditioning_set_values(conditioning, {"reference_latents": [vae.encode(img)], "reference_latents_method": method}),)
 
 
 NODE_CLASS_MAPPINGS = {"InvokeInpaintingMOSS": InvokeInpaintingMOSS, "TextEncodeMOSSInpaint": TextEncodeMOSSInpaint}

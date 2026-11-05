@@ -12,3 +12,5 @@ settings.json
 **/signed/
 .amo-upload-uuid
 disabled.txt
+**/handoff/
+**/.pi/

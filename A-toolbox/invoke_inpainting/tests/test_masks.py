@@ -180,13 +180,22 @@ class DirectEditHelpers(unittest.TestCase):
     def test_auto_context_big_box_is_a_third(self):
         self.assertEqual(masks.auto_context_padding(0, 0, 400, 700), 245)  # 0.35 * 700, not the whole picture
 
-    def test_swap_reference_latents(self):
+    def test_auto_context_grows_to_min_window(self):
+        pad = masks.min_window_padding(320, 736, 496, 1104, 129, 816, 1232)  # the diag box: 129 alone is a 0.27 MP window
+        w, h = min(816, 496 + pad) - max(0, 320 - pad), min(1232, 1104 + pad) - max(0, 736 - pad)
+        self.assertGreaterEqual(w * h, masks.MIN_WINDOW_AREA)
+        self.assertLess((w - 32) * (h - 32), masks.MIN_WINDOW_AREA)
+        self.assertEqual(masks.min_window_padding(10, 10, 50, 50, 40, 200, 200), 152)  # small picture: stops at the whole picture
+
+    def test_drop_edit_reference(self):
         cond = [["emb", {"reference_latents": ["full"], "reference_latents_method": "m", "pooled_output": 1}]]
-        out = masks.swap_reference_latents(cond, "crop")
-        self.assertEqual(out[0][1]["reference_latents"], ["crop"])
-        self.assertEqual(out[0][1]["reference_latents_method"], "m")
+        out = masks.drop_edit_reference(cond)
+        self.assertEqual(out[0][1], {"pooled_output": 1})  # only reference: no reference keys left
         self.assertEqual(cond[0][1]["reference_latents"], ["full"])  # original untouched
         self.assertTrue(masks.has_reference_latents(cond))
+        two = [["emb", {"reference_latents": ["full", "garment"], "reference_latents_method": "m", "invoke_ref_strengths": [0.5, 2.0]}]]
+        d = masks.drop_edit_reference(two)[0][1]
+        self.assertEqual((d["reference_latents"], d["invoke_ref_strengths"], d["reference_latents_method"]), (["garment"], [2.0], "m"))
         plain = [["emb", {}]]
         self.assertFalse(masks.has_reference_latents(plain))
-        self.assertEqual(masks.swap_reference_latents(plain, "crop"), plain)
+        self.assertEqual(masks.drop_edit_reference(plain), plain)
